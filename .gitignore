@@ -1,0 +1,18 @@
+# ===== 构建产物 =====
+[Bb]in/
+[Oo]bj/
+*.scmod
+*.pdb
+
+# ===== 依赖缓存（正常位于仓库同级 ../nuget-packages，此处兜底）=====
+nuget-packages/
+
+# ===== IDE / 系统文件 =====
+.vs/
+.vscode/
+.idea/
+.zcodeignore
+*.user
+*.suo
+Thumbs.db
+.DS_Store

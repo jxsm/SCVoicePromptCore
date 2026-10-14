@@ -1,0 +1,33 @@
+{
+  "ModSettings": {
+    "VoicePrompt.core": {
+      "VoicePrompt": {
+        "Name": "Voice Prompts",
+        "Title": "Voice Prompt Core Settings",
+        "Enable": {
+          "Name": "Enable Voice",
+          "Description": "When off, prompts show text only without voice"
+        },
+        "VoicePack": {
+          "Name": "Voice Pack",
+          "Description": "Audio pack in use (global, shared by all worlds). Auto = the installed pack with the highest priority"
+        },
+        "Volume": {
+          "Name": "Voice Volume",
+          "Description": "Multiplier relative to the game sound volume"
+        },
+        "Cooldown": {
+          "Name": "Per-line Cooldown (s)",
+          "Description": "Minimum interval before the same voice line can play again"
+        }
+      }
+    }
+  },
+  "VoicePromptCore": {
+    "SelectTitle": "Select Voice Pack",
+    "Auto": "Auto",
+    "AutoChoice": "Auto (highest priority)",
+    "VoiceCount": "{0} ({1} voice lines)",
+    "NoAudio": "{0} (no audio)"
+  }
+}

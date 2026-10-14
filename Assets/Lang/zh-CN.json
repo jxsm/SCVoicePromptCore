@@ -1,0 +1,33 @@
+{
+  "ModSettings": {
+    "VoicePrompt.core": {
+      "VoicePrompt": {
+        "Name": "语音提示",
+        "Title": "语音提示核心设置",
+        "Enable": {
+          "Name": "启用语音",
+          "Description": "关闭后提示只显示文字，不播放语音"
+        },
+        "VoicePack": {
+          "Name": "语音包",
+          "Description": "当前使用的语音音频包（全局生效，所有世界共用）；自动 = 取优先级最高的已安装包"
+        },
+        "Volume": {
+          "Name": "语音音量",
+          "Description": "相对游戏音效音量的倍率"
+        },
+        "Cooldown": {
+          "Name": "同一句冷却秒数",
+          "Description": "同一句语音重复播放的最小间隔，防止刷屏"
+        }
+      }
+    }
+  },
+  "VoicePromptCore": {
+    "SelectTitle": "选择语音包",
+    "Auto": "自动",
+    "AutoChoice": "自动（优先级最高）",
+    "VoiceCount": "{0}（{1} 条语音）",
+    "NoAudio": "{0}（无音频）"
+  }
+}
