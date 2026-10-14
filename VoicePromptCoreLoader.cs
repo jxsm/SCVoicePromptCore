@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Engine;
 using GameEntitySystem;
@@ -14,6 +16,7 @@ namespace Game {
     ///     例如 neuro 包的 Assets/Audio/Voice/neuro/ComponentVitalStats_12.ogg。
     ///     文本 → 逻辑键名 这层映射只由语言包决定，与具体音频包无关；
     ///     播放时拼上当前选中音频包的目录，缺失的音频由 AudioManager 静默忽略。
+    ///     第三方模组的提示可通过语音包根目录的 ExtraPrompts.json 扩展映射（段名+键号 → 本包音频文件名）。
     ///     兼容说明：不依赖 ModLoader 钩子（DisplaySmallMessage 钩子是 1.9.4+ 才有的），
     ///     全部通过 Harmony 补丁 ComponentGui/ComponentScreenOverlays 实现，1.9.3 起可用。
     /// </summary>
@@ -31,6 +34,8 @@ namespace Game {
             public readonly string AudioDir;   // ContentManager 内的音频目录，如 Audio/Voice/neuro
             public readonly int VoiceCount;
             public readonly int LoadOrder;
+            // 包根目录 ExtraPrompts.json 声明的第三方模组提示：(段名, 键号, 音频文件名)
+            public readonly List<(string section, string key, string file)> ExtraPrompts = [];
 
             public VoicePack(string packageName, string displayName, string audioDir, int voiceCount, int loadOrder) {
                 PackageName = packageName;
@@ -137,6 +142,7 @@ namespace Game {
         static Dictionary<string, string> m_exactMap = [];       // 完整提示文本 → 逻辑资源名
         static List<KeyValuePair<Regex, string>> m_regexMap = []; // 带 {0} 参数的模板 → 逻辑资源名
         static string m_indexLanguage;                            // 索引构建时的语言，切语言后重建
+        static string m_indexPackId;                              // 索引构建时激活的语音包（扩展提示随之变化）
         static readonly Dictionary<string, double> m_lastPlayTime = []; // 资源名 → 上次播放时刻（RealTime）
         static double m_lastAnyVoiceTime = -1000.0;
 
@@ -204,17 +210,19 @@ namespace Game {
                 }
                 string zipPrefix = $"Assets/{VoiceRoot}/{id}/";
                 int count = entity.ModFiles.Keys.Count(file => file.StartsWith(zipPrefix, StringComparison.OrdinalIgnoreCase));
-                m_packs.Add(new VoicePack(
+                VoicePack pack = new(
                     info.PackageName,
                     string.IsNullOrEmpty(info.Name) ? info.PackageName : info.Name,
                     $"{VoiceRoot}/{id}",
                     count,
-                    info.LoadOrder));
+                    info.LoadOrder);
+                LoadExtraPrompts(entity, pack);
+                m_packs.Add(pack);
             }
             // 自动选择的优先级：LoadOrder 大者优先（加载越晚优先级越高），同序保持发现顺序
             m_packs.Sort((a, b) => b.LoadOrder.CompareTo(a.LoadOrder));
             foreach (VoicePack pack in m_packs) {
-                Log.Information($"VoicePromptCore: found voice pack [{pack.PackageName}] \"{pack.DisplayName}\", {pack.VoiceCount} audio files.");
+                Log.Information($"VoicePromptCore: found voice pack [{pack.PackageName}] \"{pack.DisplayName}\", {pack.VoiceCount} audio files, {pack.ExtraPrompts.Count} extra prompts.");
             }
             if (m_packs.Count == 0) {
                 Log.Warning($"VoicePromptCore: no voice packs found. 未发现语音包（需安装 PackageName 以 {PackPrefix} 开头、且声明依赖 {CorePackage} 的音频资源包）");
@@ -232,6 +240,50 @@ namespace Game {
             }
             return new string(chars).Trim('.');
         }
+
+        // 解析包根目录的 ExtraPrompts.json：第三方模组提示的 段名+键号 → 本包音频文件名。
+        // 格式：{ "Prompts": [ { "Section": "某模组段名", "Key": "1", "File": "可选文件名" } ] }
+        // File 缺省为 段名_键号；音频文件必须位于本包音频目录下。
+        static void LoadExtraPrompts(ModEntity entity, VoicePack pack) {
+            entity.GetFile("ExtraPrompts.json",
+                stream => {
+                    try {
+                        using JsonDocument doc = JsonDocument.Parse(new StreamReader(stream).ReadToEnd());
+                        if (!doc.RootElement.TryGetProperty("Prompts", out JsonElement prompts)
+                            || prompts.ValueKind != JsonValueKind.Array) {
+                            Log.Warning($"VoicePromptCore: [{pack.PackageName}] ExtraPrompts.json 缺少 Prompts 数组，已忽略");
+                            return;
+                        }
+                        foreach (JsonElement item in prompts.EnumerateArray()) {
+                            if (item.ValueKind != JsonValueKind.Object) {
+                                continue;
+                            }
+                            string section = JsonGetString(item, "Section");
+                            string key = JsonGetString(item, "Key");
+                            string file = JsonGetString(item, "File");
+                            if (string.IsNullOrEmpty(section) || string.IsNullOrEmpty(key)) {
+                                Log.Warning($"VoicePromptCore: [{pack.PackageName}] ExtraPrompts.json 存在缺少 Section/Key 的条目，已跳过");
+                                continue;
+                            }
+                            file = string.IsNullOrEmpty(file) ? $"{section}_{key}" : file;
+                            if (file.IndexOf('/') >= 0 || file.IndexOf('\\') >= 0) {
+                                Log.Warning($"VoicePromptCore: [{pack.PackageName}] 扩展提示 [{section}:{key}] 的 File 含路径分隔符，已跳过");
+                                continue;
+                            }
+                            pack.ExtraPrompts.Add((section, key, file));
+                        }
+                    }
+                    catch (Exception e) {
+                        Log.Warning($"VoicePromptCore: [{pack.PackageName}] ExtraPrompts.json 解析失败，已忽略：{e.Message}");
+                    }
+                }
+            );
+        }
+
+        static string JsonGetString(JsonElement element, string name) =>
+            element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()?.Trim()
+                : null;
 
         // 当前生效的语音包：设置里选中的包；未选/失效时取优先级最高的包
         static VoicePack ActivePack() {
@@ -383,46 +435,66 @@ namespace Game {
         }
 
         static void EnsureIndex() {
+            string packId = m_activePack?.PackageName;
             if (m_exactMap.Count > 0
-                && m_indexLanguage == LanguageControl.CurrentLanguageName) {
+                && m_indexLanguage == LanguageControl.CurrentLanguageName
+                && m_indexPackId == packId) {
                 return;
             }
             m_exactMap = [];
             m_regexMap = [];
             m_indexLanguage = LanguageControl.CurrentLanguageName;
+            m_indexPackId = packId;
             foreach ((string section, string key, string slot) in Entries) {
-                if (!LanguageControl.TryGet(out string template, section, key)) {
-                    continue;
-                }
-                string resourceName = slot == null ? $"{section}_{key}" : $"{section}_{key}_{slot}";
-                if (slot != null
-                    && LanguageControl.TryGet(out string slotText, "ComponentVitalStats", SlotKeys[slot])) {
-                    // 部位提示：把 {0} 填成部位文案后可精确匹配
-                    m_exactMap[string.Format(template, slotText)] = resourceName;
-                }
-                else if (template.Contains('{')) {
-                    // 含 {0}/{1} 动态参数的模板（工具名、等级数字等），转成正则。
-                    // 先用控制字符占位再 Escape，避免 Regex.Escape 产生的 "\{0\}" 无法整段替换
-                    string escaped = Regex.Escape(
-                            template.Replace("{0}", "\u0001").Replace("{1}", "\u0002").Replace("{2}", "\u0003"))
-                        .Replace("\u0001", ".+?")
-                        .Replace("\u0002", ".+?")
-                        .Replace("\u0003", ".+?");
-                    string pattern = "^" + escaped + "$";
-                    try {
-                        m_regexMap.Add(new(new Regex(pattern, RegexOptions.Compiled), resourceName));
-                    }
-                    catch (ArgumentException) {
-                        Log.Warning($"VoicePromptCore: invalid template [{section}:{key}] {template}");
-                    }
-                }
-                else {
-                    m_exactMap[template] = resourceName;
-                }
+                AddPromptToIndex(section, key, slot == null ? $"{section}_{key}" : $"{section}_{key}_{slot}", slot);
             }
             // 磁铁超限提示是硬编码英文，不经过语言包
             m_exactMap["Too many magnets"] = "MagnetBlock_TooMany";
-            Log.Information($"VoicePromptCore: indexed {m_exactMap.Count} exact + {m_regexMap.Count} pattern prompts ({m_indexLanguage})");
+            // 当前激活语音包的扩展提示（ExtraPrompts.json 声明的第三方模组键）
+            int extraIndexed = 0;
+            if (m_activePack != null) {
+                foreach ((string section, string key, string file) in m_activePack.ExtraPrompts) {
+                    if (AddPromptToIndex(section, key, file, null)) {
+                        extraIndexed++;
+                    }
+                    else {
+                        Log.Warning($"VoicePromptCore: extra prompt [{section}:{key}] (pack {m_activePack.PackageName}) not found in current language pack, skipped. 当前语言包无此键，已跳过");
+                    }
+                }
+            }
+            Log.Information($"VoicePromptCore: indexed {m_exactMap.Count} exact + {m_regexMap.Count} pattern prompts ({m_indexLanguage}, extra {extraIndexed})");
+        }
+
+        // 把一条 语言段名+键号 加入索引；返回是否成功（当前语言包无此键时为 false）
+        static bool AddPromptToIndex(string section, string key, string resourceName, string slot) {
+            if (!LanguageControl.TryGet(out string template, section, key)) {
+                return false;
+            }
+            if (slot != null
+                && LanguageControl.TryGet(out string slotText, "ComponentVitalStats", SlotKeys[slot])) {
+                // 部位提示：把 {0} 填成部位文案后可精确匹配
+                m_exactMap[string.Format(template, slotText)] = resourceName;
+            }
+            else if (template.Contains('{')) {
+                // 含 {0}/{1} 动态参数的模板（工具名、等级数字等），转成正则。
+                // 先用控制字符占位再 Escape，避免 Regex.Escape 产生的 "\{0\}" 无法整段替换
+                string escaped = Regex.Escape(
+                        template.Replace("{0}", "\u0001").Replace("{1}", "\u0002").Replace("{2}", "\u0003"))
+                    .Replace("\u0001", ".+?")
+                    .Replace("\u0002", ".+?")
+                    .Replace("\u0003", ".+?");
+                string pattern = "^" + escaped + "$";
+                try {
+                    m_regexMap.Add(new(new Regex(pattern, RegexOptions.Compiled), resourceName));
+                }
+                catch (ArgumentException) {
+                    Log.Warning($"VoicePromptCore: invalid template [{section}:{key}] {template}");
+                }
+            }
+            else {
+                m_exactMap[template] = resourceName;
+            }
+            return true;
         }
     }
 }
