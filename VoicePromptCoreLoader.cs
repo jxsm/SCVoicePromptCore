@@ -118,7 +118,12 @@ namespace Game {
             ("SubsystemFurnitureBlockBehavior", "4", null), ("SubsystemFurnitureBlockBehavior", "5", null),
             ("SubsystemFurnitureBlockBehavior", "6", null),
             ("SubsystemEggBlockBehavior", "1", null),
-            ("CRMessage", "0", null), ("CRMessage", "1", null)
+            ("CRMessage", "0", null), ("CRMessage", "1", null),
+            // 大字横幅（DisplayLargeMessage 通道）：开场剧情 / 跨年烟花
+            ("ComponentIntro", "1", null), ("ComponentIntro", "2", null),
+            ("ComponentIntro", "3", null), ("ComponentIntro", "4", null),
+            ("SubsystemFireworksBlockBehavior", "1", null),
+            ("SubsystemFireworksBlockBehavior", "2", null)
         ];
 
         // 部位后缀 → ComponentVitalStats 中的部位文案键（头部/躯干/腿部/脚部）
@@ -147,6 +152,7 @@ namespace Game {
                 Harmony harmony = new(CorePackage);
                 HarmonyMethod guiPostfix = new(typeof(VoicePromptCoreLoader), nameof(GuiSmallMessagePostfix));
                 HarmonyMethod overlayPostfix = new(typeof(VoicePromptCoreLoader), nameof(OverlayMessagePostfix));
+                HarmonyMethod largePostfix = new(typeof(VoicePromptCoreLoader), nameof(GuiLargeMessagePostfix));
                 // ComponentGui.DisplaySmallMessage 的两个字符串重载（4 参数与带 fontScale 的 5 参数互不调用，各补一次不会重复触发）
                 Patch(harmony, AccessTools.Method(
                         typeof(ComponentGui), nameof(ComponentGui.DisplaySmallMessage),
@@ -157,6 +163,10 @@ namespace Game {
                 // 画面浮字（好困啊…/好热啊…）与 ScreenOverlays.Message（睡眠不足失去知觉）
                 Patch(harmony, AccessTools.PropertySetter(typeof(ComponentScreenOverlays), nameof(ComponentScreenOverlays.FloatingMessage)), overlayPostfix);
                 Patch(harmony, AccessTools.PropertySetter(typeof(ComponentScreenOverlays), nameof(ComponentScreenOverlays.Message)), overlayPostfix);
+                // 大字横幅（开场剧情、跨年烟花）：largeText / smallText 都可能是提示文本
+                Patch(harmony, AccessTools.Method(
+                        typeof(ComponentGui), nameof(ComponentGui.DisplayLargeMessage),
+                        [typeof(string), typeof(string), typeof(float), typeof(float)]), largePostfix);
                 Log.Information("VoicePromptCore: Harmony patches applied. 语音提示核心补丁已挂接");
             }
             catch (Exception e) {
@@ -304,6 +314,17 @@ namespace Game {
             SubsystemAudio subsystemAudio = project?.FindSubsystem<SubsystemAudio>(false);
             if (subsystemAudio != null) {
                 TryPlayVoice(subsystemAudio, IsLocalPlayer(__instance.Entity), value);
+            }
+        }
+
+        // 大字横幅的后置补丁（largeText 与 smallText 各自过一遍反查；烟花的主/副文本、剧情的台词都能命中）
+        static void GuiLargeMessagePostfix(ComponentGui __instance, string largeText, string smallText) {
+            bool isLocalPlayer = IsLocalPlayer(__instance.Entity);
+            if (!string.IsNullOrEmpty(largeText)) {
+                TryPlayVoice(__instance.m_subsystemAudio, isLocalPlayer, largeText);
+            }
+            if (!string.IsNullOrEmpty(smallText)) {
+                TryPlayVoice(__instance.m_subsystemAudio, isLocalPlayer, smallText);
             }
         }
 
