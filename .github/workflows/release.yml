@@ -1,0 +1,62 @@
+name: Release 发行版
+
+# 推送 v* 标签（如 v1.0.1）时：把 modinfo.json 的 Version 同步为标签号，
+# Release 构建出 .scmod，创建 GitHub Release 并附上文件与 sha256
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Sync modinfo version from tag
+        id: ver
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          $json = Get-Content modinfo.json -Raw | ConvertFrom-Json
+          $json.Version = $version
+          $json | ConvertTo-Json -Depth 10 | Set-Content modinfo.json -Encoding utf8
+          Write-Host "modinfo.json Version -> $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build (Release)
+        run: dotnet build -c Release
+
+      - name: Calculate sha256
+        id: hash
+        shell: pwsh
+        run: |
+          $sha = (Get-FileHash "bin/Release/VoicePromptCore.scmod" -Algorithm SHA256).Hash.ToLower()
+          "sha256=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = @"
+          自动构建发行版。
+
+          **下载 `VoicePromptCore.scmod`**，与任意语音音频包一起放入游戏 Mods 目录即可。
+          安装说明见 README；语音包制作见 docs/语音包制作指南.md。
+
+          - 包名：VoicePrompt.core
+          - 版本：${{ steps.ver.outputs.version }}
+          - 兼容 API：1.9.3+
+          - sha256：${{ steps.hash.outputs.sha256 }}
+          "@
+          gh release create $env:GITHUB_REF_NAME "bin/Release/VoicePromptCore.scmod" --title "VoicePromptCore ${{ steps.ver.outputs.version }}" --notes $notes

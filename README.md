@@ -58,6 +58,22 @@ dotnet build    # 产物 bin/Debug/VoicePromptCore.scmod
 
 NuGet 源（nuget.org + SurvivalcraftAPI 官方源）已在 `nuget.config` 里配好；包缓存固定在仓库**同级**目录（`nuget.config` 的 `global-packages-folder`），不写入用户主目录，也不会进仓库。
 
+## 自动构建与发布（GitHub Actions）
+
+| 工作流 | 触发 | 作用 |
+|---|---|---|
+| `ci.yml` | push 到 main / PR / 手动 | Release 构建检查，并上传 `.scmod` 构建产物 |
+| `release.yml` | 推送 `v*` 标签 | 自动把 `modinfo.json` 的 `Version` 同步为标签号 → Release 构建 → 创建 GitHub Release（附 `VoicePromptCore.scmod` 与 sha256） |
+
+发新版本只需要：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+Release 页面几分钟后就会出现带 `.scmod` 附件的发行版。
+
 ## 制作自己的语音包
 
 不需要编程：准备音频 + 一个 modinfo.json，打包成 `.scmod` 即可。核心会自动发现并列入设置。

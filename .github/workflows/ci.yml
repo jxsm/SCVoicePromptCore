@@ -1,0 +1,31 @@
+name: CI 构建检查
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # nuget.config 已配好 nuget.org + SurvivalcraftAPI 官方源，
+      # 包缓存按配置落在仓库同级目录，不会污染 runner 用户目录
+      - name: Build (Release)
+        run: dotnet build -c Release
+
+      - name: Upload scmod artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoicePromptCore.scmod
+          path: bin/Release/VoicePromptCore.scmod
+          if-no-files-found: error
