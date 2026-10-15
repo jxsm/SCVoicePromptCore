@@ -5,20 +5,23 @@ using System.Linq;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Engine;
+using Engine.Audio;
 using GameEntitySystem;
 using HarmonyLib;
 
 namespace Game {
     /// <summary>
-    ///     语音提示核心：负责提示拦截、文本反查键位、冷却去重与设置，本身不含音频。
-    ///     语音由「音频包」提供：PackageName 以 voice.prompt.pack. 开头的纯资源模组，
-    ///     音频位于 Assets/Audio/Voice/&lt;包id&gt;/ 下，命名规则「语言段名_键号[_部位].ogg」，
-    ///     例如 neuro 包的 Assets/Audio/Voice/neuro/ComponentVitalStats_12.ogg。
-    ///     文本 → 逻辑键名 这层映射只由语言包决定，与具体音频包无关；
-    ///     播放时拼上当前选中音频包的目录，缺失的音频由 AudioManager 静默忽略。
-    ///     第三方模组的提示可通过语音包根目录的 ExtraPrompts.json 扩展映射（段名+键号 → 本包音频文件名）。
-    ///     兼容说明：不依赖 ModLoader 钩子（DisplaySmallMessage 钩子是 1.9.4+ 才有的），
-    ///     全部通过 Harmony 补丁 ComponentGui/ComponentScreenOverlays 实现，1.9.3 起可用。
+        ///     语音提示核心：负责提示拦截、文本反查键位、冷却去重与设置，本身不含音频。
+        ///     语音由「音频包」提供：PackageName 以 voice.prompt.pack. 开头的纯资源模组，
+        ///     音频位于 Assets/Audio/Voice/&lt;包id&gt;/ 下，每个键既可以是单文件
+        ///     （语言段名_键号[_部位].ogg，如 ComponentVitalStats_12.ogg），
+        ///     也可以是同名文件夹（ComponentGui_13/…），文件夹内多条音频随机挑一条播放。
+        ///     文本 → 逻辑键名 这层映射只由语言包决定，与具体音频包无关；
+        ///     播放时拼上当前选中音频包的目录，缺失的音频由核心静默跳过。
+        ///     第三方模组的提示可通过语音包根目录的 ExtraPrompts.json 扩展映射（段名+键号 → 本包音频文件名）。
+        ///     Interrupt 设置开启时，新语音触发会立即打断正在播放的上一条语音。
+        ///     兼容说明：不依赖 ModLoader 钩子（DisplaySmallMessage 钩子是 1.9.4+ 才有的），
+        ///     全部通过 Harmony 补丁 ComponentGui/ComponentScreenOverlays 实现，1.9.3 起可用。
     /// </summary>
     public class VoicePromptCoreLoader : ModLoader {
         public const string CorePackage = "VoicePrompt.core";
@@ -143,8 +146,12 @@ namespace Game {
         static List<KeyValuePair<Regex, string>> m_regexMap = []; // 带 {0} 参数的模板 → 逻辑资源名
         static string m_indexLanguage;                            // 索引构建时的语言，切语言后重建
         static string m_indexPackId;                              // 索引构建时激活的语音包（扩展提示随之变化）
-        static readonly Dictionary<string, double> m_lastPlayTime = []; // 资源名 → 上次播放时刻（RealTime）
+        static readonly Dictionary<string, double> m_lastPlayTime = []; // 提示名 → 上次播放时刻（RealTime）
         static double m_lastAnyVoiceTime = -1000.0;
+        static readonly Random m_random = new();
+        static readonly Dictionary<string, string[]> m_variantCache = []; // 提示名 → 同名文件夹内变体的完整内容路径
+        static readonly Dictionary<string, string> m_lastVariant = [];   // 提示名 → 上次播放的变体（避免连抽同一条）
+        static SoundBuffer m_currentVoiceBuffer;                         // 正在播放语音的缓冲（按引用识别，用于打断）
 
         // 已发现的语音包，按自动选择优先级排序（LoadOrder 大者优先）
         static readonly List<VoicePack> m_packs = [];
@@ -307,6 +314,8 @@ namespace Game {
         static void InvalidateActivePack() {
             m_activeResolved = false;
             m_activePack = null;
+            m_variantCache.Clear();
+            m_lastVariant.Clear();
         }
 
         public override void OnModSettingChanged(string[] idPath, object value) {
@@ -416,8 +425,73 @@ namespace Game {
             }
             m_lastAnyVoiceTime = now;
             m_lastPlayTime[name] = now;
-            // 资源不存在时 AudioManager 内部静默忽略，不会报错刷屏
-            subsystemAudio.PlaySound($"{pack.AudioDir}/{name}", volume, 0f, 0f, 0f);
+            PlayVoice(subsystemAudio, pack, name, volume);
+        }
+
+        // 播放一条语音：先解析最终路径（单文件或文件夹随机变体）并取缓冲，
+        // 缺失资源在这里静默跳过；打断开启时先停掉正在播放的上一条，再走游戏原播放队列
+        static void PlayVoice(SubsystemAudio subsystemAudio, VoicePack pack, string name, float volume) {
+            string path = ResolveVoicePath(pack, name);
+            SoundBuffer buffer = ContentManager.Get<SoundBuffer>(path, null, false);
+            if (buffer == null) {
+                return;
+            }
+            if (!ModSettingsManager.TryGet(out bool interrupt, CorePackage, SettingsPageId, "Interrupt") || interrupt) {
+                StopCurrentVoice();
+            }
+            // 仍走 SubsystemAudio 队列：沿用音量缩放、暂停时不播等原生行为
+            subsystemAudio.PlaySound(path, volume, 0f, 0f, 0f);
+            m_currentVoiceBuffer = buffer;
+        }
+
+        // 停掉正在播放的上一条语音。游戏的一次性音效是 disposeOnStop 的 Sound，
+        // 播完后由 Mixer 逐帧回收；ContentManager 按名缓存缓冲，引用相同即为同一条语音
+        static void StopCurrentVoice() {
+            if (m_currentVoiceBuffer == null) {
+                return;
+            }
+            Sound[] snapshot = new Sound[Mixer.m_soundsToStopPoll.Count];
+            Mixer.m_soundsToStopPoll.CopyTo(snapshot);
+            foreach (Sound sound in snapshot) {
+                if (sound.SoundBuffer == m_currentVoiceBuffer) {
+                    sound.Stop();
+                }
+            }
+            m_currentVoiceBuffer = null;
+        }
+
+        // 提示名 → 实际播放路径：同名文件夹内有音频就随机挑一条，否则回退单文件路径
+        static string ResolveVoicePath(VoicePack pack, string name) {
+            if (!m_variantCache.TryGetValue(name, out string[] variants)) {
+                List<string> list = [];
+                // List 按「前缀 + /」匹配：单文件的 ContentPath 不带斜杠段，不会命中，只有文件夹内条目会
+                ReadOnlyList<ContentInfo> entries = ContentManager.List($"{pack.AudioDir}/{name}");
+                for (int i = 0; i < entries.Count; i++) {
+                    string suffix = entries[i].ContentSuffix;
+                    if (suffix == ".ogg" || suffix == ".wav" || suffix == ".mp3" || suffix == ".flac") {
+                        list.Add(entries[i].ContentPath);
+                    }
+                }
+                variants = [.. list];
+                m_variantCache[name] = variants;
+            }
+            if (variants.Length == 0) {
+                return $"{pack.AudioDir}/{name}";
+            }
+            // 两条以上时避开上一次抽到的变体（标准排除法：在前 n-1 位抽，命中排除项就改用末位）
+            string pick;
+            if (variants.Length > 1 && m_lastVariant.TryGetValue(name, out string last)) {
+                int index = m_random.Int(0, variants.Length - 2);
+                if (variants[index] == last) {
+                    index = variants.Length - 1;
+                }
+                pick = variants[index];
+            }
+            else {
+                pick = variants[m_random.Int(0, variants.Length - 1)];
+            }
+            m_lastVariant[name] = pick;
+            return pick;
         }
 
         // 提示文本 → 逻辑资源名；先精确匹配，再按参数模板正则匹配

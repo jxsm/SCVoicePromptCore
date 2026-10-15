@@ -12,6 +12,10 @@
           "Name": "Voice Pack",
           "Description": "Audio pack in use (global, shared by all worlds). Auto = the installed pack with the highest priority"
         },
+        "Interrupt": {
+          "Name": "Interrupt Playing Voice",
+          "Description": "A new voice line immediately cuts off the one currently playing instead of overlapping"
+        },
         "Volume": {
           "Name": "Voice Volume",
           "Description": "Multiplier relative to the game sound volume"
