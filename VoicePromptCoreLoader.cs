@@ -19,7 +19,8 @@ namespace Game {
         ///     文本 → 逻辑键名 这层映射只由语言包决定，与具体音频包无关；
         ///     播放时拼上当前选中音频包的目录，缺失的音频由核心静默跳过。
         ///     第三方模组的提示可通过语音包根目录的 ExtraPrompts.json 扩展映射（段名+键号 → 本包音频文件名）。
-        ///     Interrupt 设置开启时，新语音触发会立即打断正在播放的上一条语音。
+        ///     Interrupt 设置开启时，新语音触发会立即打断正在播放的上一条语音（语音由核心直接创建
+        ///     并持有 Sound 播放，不经游戏播放队列，因此暂停菜单中的提示也会照常发声）。
         ///     兼容说明：不依赖 ModLoader 钩子（DisplaySmallMessage 钩子是 1.9.4+ 才有的），
         ///     全部通过 Harmony 补丁 ComponentGui/ComponentScreenOverlays 实现，1.9.3 起可用。
     /// </summary>
@@ -28,7 +29,8 @@ namespace Game {
         public const string PackPrefix = "voice.prompt.pack.";
         public const string VoiceRoot = "Audio/Voice";
         public const string SettingsPageId = "VoicePrompt";
-        public const float DefaultGlobalGap = 1f; // 任意两句语音之间的最小间隔（秒）
+        public const float DefaultGlobalGap = 1f;           // 叠加模式下任意两句语音之间的最小间隔（秒），防叠音刷屏
+        public const float InterruptibleGlobalGap = 0.1f;   // 打断模式下的全局间隔（秒）：即切即播，只防同帧抖动
 
         /// <summary>一个已安装的语音音频包（纯资源模组）。</summary>
         public class VoicePack {
@@ -151,7 +153,7 @@ namespace Game {
         static readonly Random m_random = new();
         static readonly Dictionary<string, string[]> m_variantCache = []; // 提示名 → 同名文件夹内变体的完整内容路径
         static readonly Dictionary<string, string> m_lastVariant = [];   // 提示名 → 上次播放的变体（避免连抽同一条）
-        static SoundBuffer m_currentVoiceBuffer;                         // 正在播放语音的缓冲（按引用识别，用于打断）
+        static Sound m_currentSound;                                      // 正在播放的语音（核心直接创建并持有，打断即 Stop）
 
         // 已发现的语音包，按自动选择优先级排序（LoadOrder 大者优先）
         static readonly List<VoicePack> m_packs = [];
@@ -418,46 +420,54 @@ namespace Game {
             }
             ModSettingsManager.TryGet(out float volume, CorePackage, SettingsPageId, "Volume");
             ModSettingsManager.TryGet(out int cooldown, CorePackage, SettingsPageId, "Cooldown");
+            bool interrupt = !ModSettingsManager.TryGet(out bool interruptOn, CorePackage, SettingsPageId, "Interrupt") || interruptOn;
+            // 打断模式：全局间隔缩到 0.1 秒（即切即播，只防同帧抖动），防刷屏交给每句冷却；
+            // 叠加模式：保持 1 秒全局间隔，防止两句语音叠着响
+            double gap = interrupt ? InterruptibleGlobalGap : DefaultGlobalGap;
             double now = Time.RealTime;
-            if (now - m_lastAnyVoiceTime < DefaultGlobalGap
+            if (now - m_lastAnyVoiceTime < gap
                 || m_lastPlayTime.TryGetValue(name, out double last) && now - last < Math.Max(cooldown, 0)) {
                 return;
             }
             m_lastAnyVoiceTime = now;
             m_lastPlayTime[name] = now;
-            PlayVoice(subsystemAudio, pack, name, volume);
+            PlayVoice(pack, name, volume, interrupt);
         }
 
-        // 播放一条语音：先解析最终路径（单文件或文件夹随机变体）并取缓冲，
-        // 缺失资源在这里静默跳过；打断开启时先停掉正在播放的上一条，再走游戏原播放队列
-        static void PlayVoice(SubsystemAudio subsystemAudio, VoicePack pack, string name, float volume) {
+        // 播放一条语音：解析最终路径（单文件或文件夹随机变体），核心直接创建 Sound 播放并持有引用——
+        // 打断即对这个引用 Stop，无入队延迟也不会追丢。缺失资源在这里静默跳过。
+        // 注意：不经 SubsystemAudio 播放队列，暂停菜单打开时的提示语音也会照常发声（音量缩放与游戏一致）。
+        static void PlayVoice(VoicePack pack, string name, float volume, bool interrupt) {
             string path = ResolveVoicePath(pack, name);
-            SoundBuffer buffer = ContentManager.Get<SoundBuffer>(path, null, false);
-            if (buffer == null) {
-                return;
+            try {
+                SoundBuffer buffer = ContentManager.Get<SoundBuffer>(path, null, false);
+                if (buffer == null) {
+                    return;
+                }
+                // 与 AudioManager.PlaySound 相同的音量门槛与缩放
+                float effective = volume * SettingsManager.SoundsVolume;
+                if (SettingsManager.SoundsVolume <= 0f || effective <= AudioManager.MinAudibleVolume) {
+                    return;
+                }
+                if (interrupt) {
+                    StopCurrentVoice();
+                }
+                // disposeOnStop=true：播完由 Mixer 逐帧自动回收；音高 1 = 不变调
+                Sound sound = new(buffer, effective, 1f, 0f, false, true);
+                sound.Play();
+                m_currentSound = sound;
             }
-            if (!ModSettingsManager.TryGet(out bool interrupt, CorePackage, SettingsPageId, "Interrupt") || interrupt) {
-                StopCurrentVoice();
+            catch (Exception e) {
+                Log.Warning($"VoicePromptCore: failed to play voice [{path}]: {e.Message}. 播放语音失败");
             }
-            // 仍走 SubsystemAudio 队列：沿用音量缩放、暂停时不播等原生行为
-            subsystemAudio.PlaySound(path, volume, 0f, 0f, 0f);
-            m_currentVoiceBuffer = buffer;
         }
 
-        // 停掉正在播放的上一条语音。游戏的一次性音效是 disposeOnStop 的 Sound，
-        // 播完后由 Mixer 逐帧回收；ContentManager 按名缓存缓冲，引用相同即为同一条语音
+        // 停掉正在播放的上一条语音（disposeOnStop 的 Sound，Stop 即释放）
         static void StopCurrentVoice() {
-            if (m_currentVoiceBuffer == null) {
-                return;
+            if (m_currentSound != null && m_currentSound.State != SoundState.Disposed) {
+                m_currentSound.Stop();
             }
-            Sound[] snapshot = new Sound[Mixer.m_soundsToStopPoll.Count];
-            Mixer.m_soundsToStopPoll.CopyTo(snapshot);
-            foreach (Sound sound in snapshot) {
-                if (sound.SoundBuffer == m_currentVoiceBuffer) {
-                    sound.Stop();
-                }
-            }
-            m_currentVoiceBuffer = null;
+            m_currentSound = null;
         }
 
         // 提示名 → 实际播放路径：同名文件夹内有音频就随机挑一条，否则回退单文件路径
